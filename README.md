@@ -2,7 +2,7 @@
 
 A keyboard-driven project launcher for [Claude Code](https://claude.com/claude-code) on [omarchy](https://omarchy.org/) / Hyprland.
 
-Press **Super+I**, pick a project, and Claude Code opens in a tmux window. All projects share one terminal and one tmux session — switch between them with `Ctrl+B n/p/w`.
+Press **Super+I**, pick a project, and Claude Code opens in a tmux window. All projects share one terminal and one tmux session — switch between them with `Alt+1`..`Alt+9` (with omarchy's default tmux config).
 
 ![claude-launcher walker picker](docs/screenshot.png)
 
@@ -80,12 +80,16 @@ Press **Super+I**. A walker popup appears with:
 
 ### Switching projects inside the terminal
 
-Once the terminal is open, you can use standard tmux keybindings:
+With omarchy's default tmux config:
 
-- `Ctrl+B n` — next window
-- `Ctrl+B p` — previous window
-- `Ctrl+B w` — window picker
+- `Alt+1` .. `Alt+9` — jump to window by number
+- `Alt+Left` / `Alt+Right` — previous / next window
+- `Ctrl+B w` — window picker (shows names and previews)
 - `Ctrl+B d` — detach (keeps everything running in the background)
+
+Or (vanilla tmux):
+
+- `Ctrl+B n` / `Ctrl+B p` — next / previous window
 
 ## Configuration
 
