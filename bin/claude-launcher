@@ -1,0 +1,193 @@
+#!/usr/bin/env bash
+# claude-launcher — A project launcher for Claude Code on omarchy/Hyprland.
+#
+# Design: A single tmux session (default name "claude") holds one window per
+# project. On first invocation the launcher opens a terminal attached to the
+# session. Subsequent invocations add or switch to project windows inside the
+# same terminal, and bring its window to the foreground via hyprctl.
+#
+# Directory layout (required): $CLAUDE_LAUNCHER_WORKS_DIR/<namespace>/<name>/
+#
+# Environment variables:
+#   CLAUDE_LAUNCHER_WORKS_DIR  Root of projects (default: $HOME/Works)
+#   CLAUDE_LAUNCHER_DEFAULT_NS Namespace used when user types just a bare
+#                              name when creating a project. If unset, users
+#                              must type "ns/name" explicitly.
+#   CLAUDE_LAUNCHER_TERMINAL   Terminal emulator (default: $TERMINAL, else
+#                              alacritty). Must support `--class` and `-e`.
+#   CLAUDE_LAUNCHER_SESSION    tmux session name (default: claude)
+#   CLAUDE_LAUNCHER_DEBUG      If set to 1, write debug log to
+#                              /tmp/claude-launcher.log
+
+set -euo pipefail
+
+WORKS="${CLAUDE_LAUNCHER_WORKS_DIR:-$HOME/Works}"
+DEFAULT_NS="${CLAUDE_LAUNCHER_DEFAULT_NS:-}"
+SESSION="${CLAUDE_LAUNCHER_SESSION:-claude}"
+TERM_CMD="${CLAUDE_LAUNCHER_TERMINAL:-${TERMINAL:-alacritty}}"
+WIN_CLASS="claude-launcher"
+DEBUG="${CLAUDE_LAUNCHER_DEBUG:-}"
+LOG="/tmp/claude-launcher.log"
+
+log() {
+  [[ -n "$DEBUG" ]] && echo "$@" >> "$LOG"
+  return 0
+}
+
+# rel (namespace/name) → tmux window name (slashes → underscores)
+window_name() {
+  echo "${1//\//_}"
+}
+
+# Does a window for this project exist in the session?
+window_exists() {
+  local name="$1"
+  tmux list-windows -t "$SESSION" -F '#W' 2>/dev/null | grep -qx "$name"
+}
+
+# walker — pick from stdin
+walker_pick() {
+  local prompt="$1"
+  walker -d -p "$prompt" 2>/dev/null || true
+}
+
+# walker — free text input
+walker_input() {
+  local prompt="$1"
+  printf '' | walker -d -p "$prompt" 2>/dev/null || true
+}
+
+# List projects; active ones (with an open tmux window) get a ● prefix and
+# float to the top. The rest are sorted by last modification time.
+list_projects() {
+  find "$WORKS" -mindepth 2 -maxdepth 2 -type d -not -path '*/.*' 2>/dev/null | while read -r dir; do
+    rel="${dir#$WORKS/}"
+    if [[ -d "$dir/.git" ]]; then
+      d=$(git -C "$dir" log -1 --format=%ct 2>/dev/null || stat -c %Y "$dir")
+    else
+      d=$(stat -c %Y "$dir")
+    fi
+    wname=$(window_name "$rel")
+    if window_exists "$wname"; then
+      printf '0\t%s\t%s\n' "$d" "$rel"
+    else
+      printf '1\t%s\t%s\n' "$d" "$rel"
+    fi
+  done | sort -k1,1 -k2,2rn | while IFS=$'\t' read -r active _ rel; do
+    if [[ "$active" == "0" ]]; then
+      echo "● $rel"
+    else
+      echo "  $rel"
+    fi
+  done
+}
+
+# Build the shell wrapper that runs claude in a restart loop.
+# When claude exits, we drop to a prompt that restarts on Enter,
+# exits on Ctrl-D. If a previous conversation exists for this cwd,
+# use `claude -c` to resume it.
+build_inner() {
+  local dir="$1"
+  local slug
+  slug=$(echo "$dir" | sed 's|/|-|g')
+  if [[ -d "$HOME/.claude/projects/$slug" ]]; then
+    echo 'while true; do claude -c || claude; printf "\n[claude exited. Enter to restart / Ctrl-D to quit] "; read -r || break; done'
+  else
+    echo 'while true; do claude; printf "\n[claude exited. Enter to restart / Ctrl-D to quit] "; read -r || break; done'
+  fi
+}
+
+# Open a project: ensure the tmux session and window exist, select the window,
+# and either focus the existing terminal window or launch a new one.
+open_project() {
+  local rel="$1"
+  local dir="$WORKS/$rel"
+  local wname
+  wname=$(window_name "$rel")
+  local inner
+  inner=$(build_inner "$dir")
+
+  log "=== $(date) ==="
+  log "rel=$rel dir=$dir wname=$wname"
+
+  if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+    tmux new-session -d -s "$SESSION" -n "$wname" -c "$dir" "bash -lc '$inner'" 2>&1 | tee -a "$LOG" >/dev/null
+    log "created session=$SESSION window=$wname"
+  elif ! window_exists "$wname"; then
+    tmux new-window -t "$SESSION" -n "$wname" -c "$dir" "bash -lc '$inner'" 2>&1 | tee -a "$LOG" >/dev/null
+    log "added window=$wname"
+  else
+    log "window=$wname already exists"
+  fi
+
+  tmux select-window -t "$SESSION:$wname" 2>&1 | tee -a "$LOG" >/dev/null
+
+  if tmux list-clients -t "$SESSION" 2>/dev/null | grep -q .; then
+    # Terminal already attached: just focus it
+    hyprctl dispatch focuswindow "class:$WIN_CLASS" >/dev/null 2>&1 || true
+    log "focused existing window"
+  else
+    # Launch terminal attached to session
+    if command -v uwsm-app >/dev/null 2>&1; then
+      setsid uwsm-app -- "$TERM_CMD" \
+        --class "$WIN_CLASS" \
+        -e tmux attach -t "$SESSION" \
+        >/dev/null 2>&1 &
+    else
+      setsid "$TERM_CMD" \
+        --class "$WIN_CLASS" \
+        -e tmux attach -t "$SESSION" \
+        >/dev/null 2>&1 &
+    fi
+    log "launched $TERM_CMD pid=$!"
+  fi
+}
+
+create_new() {
+  local input
+  input=$(walker_input "Project name (name or ns/name)")
+  [[ -z "$input" ]] && exit 0
+
+  local rel
+  if [[ "$input" == */* ]]; then
+    rel="$input"
+  elif [[ -n "$DEFAULT_NS" ]]; then
+    rel="$DEFAULT_NS/$input"
+  else
+    notify-send "claude-launcher" "Please use ns/name format (set CLAUDE_LAUNCHER_DEFAULT_NS to use a bare name)" 2>/dev/null || \
+      echo "Please use ns/name format (set CLAUDE_LAUNCHER_DEFAULT_NS to use a bare name)" >&2
+    exit 1
+  fi
+
+  local dir="$WORKS/$rel"
+  mkdir -p "$dir"
+  open_project "$rel"
+}
+
+main() {
+  local picked
+  picked=$({ echo "+ New project..."; list_projects; } | walker_pick "Claude project")
+  [[ -z "$picked" ]] && exit 0
+
+  if [[ "$picked" == "+ New project..." ]]; then
+    create_new
+    return
+  fi
+
+  # strip prefix ("● " or "  ")
+  local rel="$picked"
+  rel="${rel#● }"
+  rel="${rel#  }"
+  rel="${rel#"${rel%%[![:space:]]*}"}"
+  rel="${rel%"${rel##*[![:space:]]}"}"
+
+  if [[ -d "$WORKS/$rel" ]]; then
+    open_project "$rel"
+  else
+    notify-send "claude-launcher" "Directory not found: $WORKS/$rel" 2>/dev/null || \
+      echo "Directory not found: $WORKS/$rel" >&2
+    exit 1
+  fi
+}
+
+main
