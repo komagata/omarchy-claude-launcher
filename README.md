@@ -77,6 +77,7 @@ Press **Super+I**. A walker popup appears with:
 
 - **Select an existing project** → the launcher switches to that project's tmux window (creates it if needed) and focuses the terminal.
 - **Select `+ New project...`** → enter a name (e.g. `myapp` or `acme/webapp`), and it creates `$CLAUDE_LAUNCHER_WORKS_DIR/<ns>/<name>/` and starts Claude there.
+- **Type a name that isn't in the list** → the launcher treats it as a new project and creates it on the spot. With `CLAUDE_LAUNCHER_DEFAULT_NS=me` set, typing `chat` creates `$CLAUDE_LAUNCHER_WORKS_DIR/me/chat/`; otherwise you need the `ns/name` form.
 
 ![terminal showing multiple project windows in tmux tabs](docs/terminal.png)
 
@@ -105,6 +106,7 @@ All configuration is via environment variables. Add these to your shell profile 
 | `CLAUDE_LAUNCHER_DEFAULT_NS` | *(unset)* | Fallback namespace when you type just a bare name on creation |
 | `CLAUDE_LAUNCHER_TERMINAL` | `$TERMINAL`, else `alacritty` | Terminal emulator |
 | `CLAUDE_LAUNCHER_SESSION` | `claude` | tmux session name |
+| `CLAUDE_LAUNCHER_CLAUDE_ARGS` | *(empty)* | Extra arguments passed to every `claude` invocation, e.g. `--dangerously-skip-permissions` |
 | `CLAUDE_LAUNCHER_DEBUG` | *(unset)* | Set to `1` to write debug logs to `/tmp/claude-launcher.log` |
 
 ### Directory layout
@@ -141,7 +143,7 @@ If you prefer a flat layout (one level deep), this launcher isn't for you right 
 Your terminal may have `gtk-single-instance=detect` or a similar setting that routes new invocations to an existing process, where the `-e` command isn't honored. Try setting `CLAUDE_LAUNCHER_TERMINAL=alacritty` (alacritty always spawns a fresh process).
 
 **On certain NVIDIA cards, ghostty crashes with `LLVM ERROR` when spawned as a subprocess.**
-This is a mesa/llvmpipe bug unrelated to this project. Workaround: `export CLAUDE_LAUNCHER_TERMINAL=alacritty`.
+This was a mesa/llvmpipe bug that has been resolved in recent versions of ghostty (tested on 1.3.1). If you still encounter it, try adding `async-backend = epoll` to your ghostty config, or fall back to alacritty: `export CLAUDE_LAUNCHER_TERMINAL=alacritty`.
 
 **The launcher says "Please use ns/name format".**
 Either prefix the name with a namespace (`myorg/myapp`) or set `CLAUDE_LAUNCHER_DEFAULT_NS` in your shell profile.

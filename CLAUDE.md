@@ -33,13 +33,15 @@ $CLAUDE_LAUNCHER_WORKS_DIR/<namespace>/<name>/
 | `CLAUDE_LAUNCHER_DEFAULT_NS` | 未設定（未設定時は `ns/name` 必須）|
 | `CLAUDE_LAUNCHER_TERMINAL` | `$TERMINAL` → `alacritty` |
 | `CLAUDE_LAUNCHER_SESSION` | `claude` |
+| `CLAUDE_LAUNCHER_CLAUDE_ARGS` | 空（`claude` 起動時の追加引数。例: `--dangerously-skip-permissions`）|
 | `CLAUDE_LAUNCHER_DEBUG` | 未設定（`1` で `/tmp/claude-launcher.log` に出力）|
 
 ## 既知のハマりどころ
 
-- **ghostty + NVIDIA**: RTX 4070 など、mesa llvmpipe フォールバックに落ちる環境で ghostty をサブプロセス起動すると LLVM error でクラッシュ（`fs_variant_partial`）。alacritty で回避。
-- **ghostty `gtk-single-instance=detect`**: 既存インスタンスを検出すると `-e` で渡したコマンドを無視して即終了する。alacritty or `--gtk-single-instance=false` で回避。
-- **tmux セッションの root コマンドに `claude -c` を直書きすると trust prompt 後にセッションが死ぬ**: trust 受理後に claude が exit するため。`bash -lc 'while true; do claude -c || claude; read -r || break; done'` でラップして再起動ループ化する。
+- **ghostty + NVIDIA (解決済み)**: RTX 4070 + ghostty 1.3.1 / mesa で LLVM クラッシュ問題は解消。`async-backend = epoll` 設定を推奨。
+- **ghostty は `--class` 非対応**: `--title` でウィンドウ識別する方式に変更済み。`hyprctl dispatch focuswindow "title:claude-launcher"` を使用。
+- **ghostty `gtk-single-instance`**: デフォルトで `false` になった（ghostty 1.3.1 で確認）。問題なし。
+- **tmux ウィンドウは claude 終了時に閉じる**: リスタートループは廃止。claude 終了後は Super+I で再選択すればよい。
 - **walker の選択結果プレフィックス除去**: `${var#??}` はマルチバイト文字と相性が悪い。`${rel#● }`・`${rel#  }` で明示的に除去すること。
 
 ## ファイル構成

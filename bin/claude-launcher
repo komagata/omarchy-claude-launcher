@@ -16,6 +16,10 @@
 #   CLAUDE_LAUNCHER_TERMINAL   Terminal emulator (default: $TERMINAL, else
 #                              alacritty). Must support `--class` and `-e`.
 #   CLAUDE_LAUNCHER_SESSION    tmux session name (default: claude)
+#   CLAUDE_LAUNCHER_CLAUDE_ARGS Extra arguments passed to every `claude`
+#                              invocation (e.g.
+#                              "--dangerously-skip-permissions").
+#                              Empty by default.
 #   CLAUDE_LAUNCHER_DEBUG      If set to 1, write debug log to
 #                              /tmp/claude-launcher.log
 
@@ -25,7 +29,8 @@ WORKS="${CLAUDE_LAUNCHER_WORKS_DIR:-$HOME/Works}"
 DEFAULT_NS="${CLAUDE_LAUNCHER_DEFAULT_NS:-}"
 SESSION="${CLAUDE_LAUNCHER_SESSION:-claude}"
 TERM_CMD="${CLAUDE_LAUNCHER_TERMINAL:-${TERMINAL:-alacritty}}"
-WIN_CLASS="claude-launcher"
+CLAUDE_ARGS="${CLAUDE_LAUNCHER_CLAUDE_ARGS:-}"
+WIN_TITLE="claude-launcher"
 DEBUG="${CLAUDE_LAUNCHER_DEBUG:-}"
 LOG="/tmp/claude-launcher.log"
 
@@ -34,9 +39,41 @@ log() {
   return 0
 }
 
-# rel (namespace/name) → tmux window name (slashes → underscores)
+# rel (namespace/name) or ("namespace/name [wt]") → tmux window name
+# slashes → underscores; "[wt]" suffix → "_wt"
 window_name() {
-  echo "${1//\//_}"
+  local s="$1"
+  s="${s//\//_}"
+  s="${s// \[/_}"
+  s="${s//]/}"
+  # sanitize: tmux windowの命名で安全な文字だけ残す
+  s="${s//[^a-zA-Z0-9_.-]/_}"
+  echo "$s"
+}
+
+# Parse "ns/name [wt]" into proj=ns/name and wtname=wt
+# Sets globals: PARSED_PROJ, PARSED_WT (empty if not worktree)
+parse_worktree_rel() {
+  local rel="$1"
+  if [[ "$rel" == *" ["*"]" ]]; then
+    PARSED_PROJ="${rel%% \[*}"
+    local tmp="${rel#*\[}"
+    PARSED_WT="${tmp%\]}"
+  else
+    PARSED_PROJ="$rel"
+    PARSED_WT=""
+  fi
+}
+
+# Resolve rel (possibly with [wt]) to directory path
+resolve_dir() {
+  local rel="$1"
+  parse_worktree_rel "$rel"
+  if [[ -n "$PARSED_WT" ]]; then
+    echo "$WORKS/$PARSED_PROJ/.claude/worktrees/$PARSED_WT"
+  else
+    echo "$WORKS/$PARSED_PROJ"
+  fi
 }
 
 # Does a window for this project exist in the session?
@@ -59,6 +96,7 @@ walker_input() {
 
 # List projects; active ones (with an open tmux window) get a ● prefix and
 # float to the top. The rest are sorted by last modification time.
+# Worktrees (.claude/worktrees/*) are listed as "ns/name [wtname]" rows.
 list_projects() {
   find "$WORKS" -mindepth 2 -maxdepth 2 -type d -not -path '*/.*' 2>/dev/null | while read -r dir; do
     rel="${dir#$WORKS/}"
@@ -73,6 +111,21 @@ list_projects() {
     else
       printf '1\t%s\t%s\n' "$d" "$rel"
     fi
+    # worktree行
+    if [[ -d "$dir/.claude/worktrees" ]]; then
+      for wt in "$dir"/.claude/worktrees/*/; do
+        [[ -d "$wt" ]] || continue
+        wtname=$(basename "$wt")
+        wtrel="${rel} [${wtname}]"
+        wtd=$(stat -c %Y "$wt" 2>/dev/null || echo "$d")
+        wtwname=$(window_name "$wtrel")
+        if window_exists "$wtwname"; then
+          printf '0\t%s\t%s\n' "$wtd" "$wtrel"
+        else
+          printf '1\t%s\t%s\n' "$wtd" "$wtrel"
+        fi
+      done
+    fi
   done | sort -k1,1 -k2,2rn | while IFS=$'\t' read -r active _ rel; do
     if [[ "$active" == "0" ]]; then
       echo "● $rel"
@@ -82,60 +135,77 @@ list_projects() {
   done
 }
 
-# Build the shell wrapper that runs claude in a restart loop.
-# When claude exits, we drop to a prompt that restarts on Enter,
-# exits on Ctrl-D. If a previous conversation exists for this cwd,
-# use `claude -c` to resume it.
+# Build the command that runs claude.
+# If a previous conversation exists for this cwd, use `claude -c` to resume it.
 build_inner() {
   local dir="$1"
   local slug
   slug=$(echo "$dir" | sed 's|/|-|g')
+  local args="$CLAUDE_ARGS"
   if [[ -d "$HOME/.claude/projects/$slug" ]]; then
-    echo 'while true; do claude -c || claude; printf "\n[claude exited. Enter to restart / Ctrl-D to quit] "; read -r || break; done'
+    echo "claude -c $args || claude $args"
   else
-    echo 'while true; do claude; printf "\n[claude exited. Enter to restart / Ctrl-D to quit] "; read -r || break; done'
+    echo "claude $args"
   fi
 }
 
 # Open a project: ensure the tmux session and window exist, select the window,
 # and either focus the existing terminal window or launch a new one.
+# For worktree rows ("ns/name [wt]"), the new window is split horizontally
+# with `bin/wt-up && docker compose logs -f web` in the bottom pane.
 open_project() {
   local rel="$1"
-  local dir="$WORKS/$rel"
+  local dir
+  dir=$(resolve_dir "$rel")
   local wname
   wname=$(window_name "$rel")
   local inner
   inner=$(build_inner "$dir")
+  parse_worktree_rel "$rel"
+  local is_wt=""
+  [[ -n "$PARSED_WT" ]] && is_wt=1
 
   log "=== $(date) ==="
-  log "rel=$rel dir=$dir wname=$wname"
+  log "rel=$rel dir=$dir wname=$wname is_wt=$is_wt"
 
+  local created=""
   if ! tmux has-session -t "$SESSION" 2>/dev/null; then
     tmux new-session -d -s "$SESSION" -n "$wname" -c "$dir" "bash -lc '$inner'" 2>&1 | tee -a "$LOG" >/dev/null
     log "created session=$SESSION window=$wname"
+    created=1
   elif ! window_exists "$wname"; then
     tmux new-window -t "$SESSION" -n "$wname" -c "$dir" "bash -lc '$inner'" 2>&1 | tee -a "$LOG" >/dev/null
     log "added window=$wname"
+    created=1
   else
     log "window=$wname already exists"
+  fi
+
+  # Worktreeで新規ウィンドウ作成時は水平分割して docker ログを下に表示
+  if [[ -n "$created" && -n "$is_wt" && ( -f "$dir/docker-compose.yml" || -f "$dir/compose.yml" ) ]]; then
+    # .env.local を読んで docker compose を起動 → ログ追従
+    local wt_cmd='set -a; [ -f .env.local ] && source .env.local; set +a; docker compose --env-file .env.local up -d --build && docker compose --env-file .env.local logs -f web'
+    tmux split-window -v -l 30% -t "$SESSION:$wname" -c "$dir" "bash -lc '$wt_cmd; exec bash'" 2>&1 | tee -a "$LOG" >/dev/null
+    tmux select-pane -t "$SESSION:$wname.0" 2>&1 | tee -a "$LOG" >/dev/null
+    log "split pane: bottom=docker up+logs"
   fi
 
   tmux select-window -t "$SESSION:$wname" 2>&1 | tee -a "$LOG" >/dev/null
 
   if tmux list-clients -t "$SESSION" 2>/dev/null | grep -q .; then
     # Terminal already attached: just focus it
-    hyprctl dispatch focuswindow "class:$WIN_CLASS" >/dev/null 2>&1 || true
+    hyprctl dispatch focuswindow "title:$WIN_TITLE" >/dev/null 2>&1 || true
     log "focused existing window"
   else
     # Launch terminal attached to session
     if command -v uwsm-app >/dev/null 2>&1; then
       setsid uwsm-app -- "$TERM_CMD" \
-        --class "$WIN_CLASS" \
+        --title="$WIN_TITLE" \
         -e tmux attach -t "$SESSION" \
         >/dev/null 2>&1 &
     else
       setsid "$TERM_CMD" \
-        --class "$WIN_CLASS" \
+        --title="$WIN_TITLE" \
         -e tmux attach -t "$SESSION" \
         >/dev/null 2>&1 &
     fi
@@ -143,9 +213,10 @@ open_project() {
   fi
 }
 
-create_new() {
-  local input
-  input=$(walker_input "Project name (name or ns/name)")
+# Resolve a user-supplied name ("chat" or "ns/chat") to a rel path and
+# create the directory if needed, then open the project.
+create_from_name() {
+  local input="$1"
   [[ -z "$input" ]] && exit 0
 
   local rel
@@ -164,13 +235,128 @@ create_new() {
   open_project "$rel"
 }
 
+create_new() {
+  local input
+  input=$(walker_input "Project name (name or ns/name)")
+  create_from_name "$input"
+}
+
+# List git projects (dirs with .git) for worktree parent selection
+list_git_projects() {
+  find "$WORKS" -mindepth 2 -maxdepth 2 -type d -not -path '*/.*' 2>/dev/null | while read -r dir; do
+    [[ -d "$dir/.git" ]] || continue
+    echo "${dir#$WORKS/}"
+  done | sort
+}
+
+# Create a new git worktree under .claude/worktrees/<name>
+create_worktree() {
+  local parent
+  parent=$(list_git_projects | walker_pick "Parent project for new worktree")
+  [[ -z "$parent" ]] && exit 0
+
+  local parent_dir="$WORKS/$parent"
+  [[ -d "$parent_dir/.git" ]] || {
+    notify-send "claude-launcher" "Not a git repo: $parent" 2>/dev/null || \
+      echo "Not a git repo: $parent" >&2
+    exit 1
+  }
+
+  local wtname
+  wtname=$(walker_input "Worktree name (branch name)")
+  [[ -z "$wtname" ]] && exit 0
+
+  # バリデーション: 英数字 _ - のみ
+  if ! [[ "$wtname" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+    notify-send "claude-launcher" "Worktree name must match [a-zA-Z0-9_-]+" 2>/dev/null || \
+      echo "Worktree name must match [a-zA-Z0-9_-]+" >&2
+    exit 1
+  fi
+
+  local wt_dir="$parent_dir/.claude/worktrees/$wtname"
+  if [[ -d "$wt_dir" ]]; then
+    notify-send "claude-launcher" "Worktree already exists: $wtname" 2>/dev/null || true
+    # それでも開く
+    open_project "$parent [$wtname]"
+    return
+  fi
+
+  # git worktree add -b <name>
+  mkdir -p "$parent_dir/.claude/worktrees"
+  log "git worktree add: $wt_dir (branch=$wtname)"
+  if ! git -C "$parent_dir" worktree add "$wt_dir" -b "$wtname" 2>&1 | tee -a "$LOG"; then
+    # ブランチが既にあるかも → 既存ブランチでチェックアウト
+    git -C "$parent_dir" worktree add "$wt_dir" "$wtname" 2>&1 | tee -a "$LOG" >/dev/null || {
+      notify-send "claude-launcher" "Failed to create worktree" 2>/dev/null || \
+        echo "Failed to create worktree" >&2
+      exit 1
+    }
+  fi
+
+  # Docker連携: docker-compose.yml / compose.yml がある場合のみ .env.local を生成
+  if [[ -f "$wt_dir/docker-compose.yml" || -f "$wt_dir/compose.yml" ]]; then
+    local port
+    port=$(find_free_worktree_port "$parent_dir")
+    if [[ -z "$port" ]]; then
+      notify-send "claude-launcher" "No free port in 3010-3099" 2>/dev/null || \
+        echo "No free port in 3010-3099" >&2
+      exit 1
+    fi
+    local compose_project
+    compose_project=$(echo "${parent}_${wtname}" | tr '/' '_' | tr '[:upper:]' '[:lower:]')
+    cat > "$wt_dir/.env.local" <<EOF
+# Generated by claude-launcher for worktree: $wtname
+WEB_PORT=$port
+COMPOSE_PROJECT_NAME=$compose_project
+EOF
+    log "generated .env.local: WEB_PORT=$port COMPOSE_PROJECT_NAME=$compose_project"
+  fi
+
+  open_project "$parent [$wtname]"
+}
+
+# Find a free port in 3010..3099 avoiding ports claimed by other worktrees'
+# .env.local files under the same parent project.
+find_free_worktree_port() {
+  local parent_dir="$1"
+  local used=""
+  # 他worktreeの .env.local で使われているポート
+  if [[ -d "$parent_dir/.claude/worktrees" ]]; then
+    for env_file in "$parent_dir"/.claude/worktrees/*/.env.local; do
+      [[ -f "$env_file" ]] || continue
+      local p
+      p=$(grep -E '^WEB_PORT=' "$env_file" 2>/dev/null | cut -d= -f2 | tr -d '[:space:]')
+      [[ -n "$p" ]] && used="$used $p"
+    done
+  fi
+  local port
+  for port in $(seq 3010 3099); do
+    # listen中?
+    if ss -tln 2>/dev/null | awk '{print $4}' | grep -qE ":${port}$"; then
+      continue
+    fi
+    # 他worktreeが予約済み?
+    if [[ " $used " == *" $port "* ]]; then
+      continue
+    fi
+    echo "$port"
+    return 0
+  done
+  return 1
+}
+
 main() {
   local picked
-  picked=$({ echo "+ New project..."; list_projects; } | walker_pick "Claude project")
+  picked=$({ echo "+ New project..."; echo "+ New worktree..."; list_projects; } | walker_pick "Claude project")
   [[ -z "$picked" ]] && exit 0
 
   if [[ "$picked" == "+ New project..." ]]; then
     create_new
+    return
+  fi
+
+  if [[ "$picked" == "+ New worktree..." ]]; then
+    create_worktree
     return
   fi
 
@@ -181,12 +367,25 @@ main() {
   rel="${rel#"${rel%%[![:space:]]*}"}"
   rel="${rel%"${rel##*[![:space:]]}"}"
 
+  # worktree行 ("ns/name [wt]") の場合
+  if [[ "$rel" == *" ["*"]" ]]; then
+    parse_worktree_rel "$rel"
+    local wt_dir="$WORKS/$PARSED_PROJ/.claude/worktrees/$PARSED_WT"
+    if [[ -d "$wt_dir" ]]; then
+      open_project "$rel"
+    else
+      notify-send "claude-launcher" "Worktree not found: $rel" 2>/dev/null || \
+        echo "Worktree not found: $rel" >&2
+      exit 1
+    fi
+    return
+  fi
+
   if [[ -d "$WORKS/$rel" ]]; then
     open_project "$rel"
   else
-    notify-send "claude-launcher" "Directory not found: $WORKS/$rel" 2>/dev/null || \
-      echo "Directory not found: $WORKS/$rel" >&2
-    exit 1
+    # Typed text didn't match any listed project — treat as new project.
+    create_from_name "$rel"
   fi
 }
 
